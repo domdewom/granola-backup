@@ -1,8 +1,9 @@
 # Granola Backup Exporter
 
-Daily incremental backup for Granola meetings. The exporter writes generated
-artifacts locally under `backups/`; those generated artifacts are ignored on
-`main` by default.
+This is a [Granola.ai](https://www.granola.ai/) meetings export script best used
+to daily incrementally back up meetings to your GitHub. The exporter writes
+generated artifacts into the `granola-backups` branch. Locally, artifacts are
+stored under `backups/`, but ignored on `main` by default.
 
 This is an unofficial exporter that relies on Granola API behavior observed
 from the desktop app. It is not affiliated with or endorsed by Granola.
@@ -55,7 +56,6 @@ sensitive data.
 - `.github/workflows/granola-backup.yml`: daily workflow
 - `backup.config.yaml`: runtime config
 - `backups/`: generated output artifacts and manifests, ignored by Git
-- `analysis/`: local analysis workspace, ignored by Git
 
 Export paths:
 
@@ -65,9 +65,9 @@ Export paths:
 
 ## Generated Artifacts and Git
 
-- `backups/` and `analysis/` are ignored in `.gitignore`.
+- `backups/` is ignored in `.gitignore`.
 - Existing backup files have been removed from Git tracking with `git rm --cached`; the files can still exist locally.
-- Moving `backups/` or `analysis/` out of this repo will not remove tracked files from Git, because neither folder is currently tracked.
+- Moving `backups/` out of this repo will not remove tracked files from Git, because it is not currently tracked.
 - The exporter always recreates `backups/` inside the repo on the next run. If `backups/manifests/sync_state.json` is moved away, the next run has no incremental marker and behaves like a first export.
 
 ## GitHub Actions Backup Branch

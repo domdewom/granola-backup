@@ -33,6 +33,10 @@ Recommended setup:
 4. Keep `main` for code and config.
 5. Let the workflow publish generated backups to the `granola-backups` branch.
 
+The workflow is intentionally included in the template. If it runs before
+`GRANOLA_SUPABASE_JSON` is configured, it exits successfully with a setup notice
+and does not create backup files or branches.
+
 ## Privacy and Security
 
 Exported backups contain private meeting content, transcripts, notes, metadata,
@@ -112,7 +116,8 @@ python scripts/export_granola.py
 ## GitHub Actions Setup
 
 The workflow can run on a schedule or manually from the Actions tab. It expects
-the `GRANOLA_SUPABASE_JSON` repository secret to be present.
+the `GRANOLA_SUPABASE_JSON` repository secret to be present. Without that
+secret, the workflow skips cleanly and prints a setup notice.
 
 To add the secret:
 
@@ -128,6 +133,8 @@ cron: "0 2 * * *"
 ```
 
 You can change that cron expression in `.github/workflows/granola-backup.yml`.
+Generated backups are published to `granola-backups`, not `main`, so the default
+branch stays focused on code, config, docs, and workflow files.
 
 ## Progress Output
 

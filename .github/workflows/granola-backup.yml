@@ -28,15 +28,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check setup
+        id: setup
+        run: |
+          if [ -z "${GRANOLA_SUPABASE_JSON:-}" ]; then
+            echo "::notice title=Granola backup not configured::Add the GRANOLA_SUPABASE_JSON repository secret in Settings > Secrets and variables > Actions, then rerun this workflow."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Python
+        if: steps.setup.outputs.configured == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install dependencies
+        if: steps.setup.outputs.configured == 'true'
         run: pip install -r requirements.txt
 
       - name: Restore previous backup state
+        if: steps.setup.outputs.configured == 'true'
         run: |
           set -euo pipefail
           BACKUP_BRANCH="granola-backups"
@@ -53,9 +66,11 @@ jobs:
           fi
 
       - name: Export Granola backups
+        if: steps.setup.outputs.configured == 'true'
         run: python scripts/export_granola.py
 
       - name: Publish backups to backup branch
+        if: steps.setup.outputs.configured == 'true'
         run: |
           set -euo pipefail
           BACKUP_BRANCH="granola-backups"

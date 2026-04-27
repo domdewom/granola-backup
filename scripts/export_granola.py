@@ -1,0 +1,907 @@
+#!/usr/bin/env python3
+"""Incremental Granola backup exporter.
+
+Exports per meeting:
+- notes.md / notes.json
+- enhanced.md / enhanced.json
+- transcript.md / transcript.json
+- meeting.json (metadata snapshot)
+
+State is tracked in backups/manifests/sync_state.json.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import requests
+
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover
+    load_dotenv = None
+
+try:
+    from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+except Exception:  # pragma: no cover
+    Progress = None
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
+
+
+API_BASE_DEFAULT = "https://api.granola.ai"
+WORKOS_AUTH_URL = "https://api.workos.com/user_management/authenticate"
+DEFAULT_CLIENT_ID = "client_GranolaMac"
+APP_VERSION = "7.0.0"
+PAGE_SIZE = 100
+MAX_PAGES = 1000
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+
+
+@dataclasses.dataclass
+class RetryConfig:
+    max_attempts: int = 6
+    backoff_seconds: list[int] = dataclasses.field(default_factory=lambda: [2, 5, 15, 30, 60])
+
+
+@dataclasses.dataclass
+class HealthGuardConfig:
+    drop_threshold_percent: int = 60
+    min_expected_items: int = 3
+
+
+@dataclasses.dataclass
+class ExportConfig:
+    max_requests_per_second: float = 2.0
+    workspace_id: str | None = None
+    retry: RetryConfig = dataclasses.field(default_factory=RetryConfig)
+    health_guard: HealthGuardConfig = dataclasses.field(default_factory=HealthGuardConfig)
+
+
+@dataclasses.dataclass
+class PhaseState:
+    name: str
+    total: int
+    current: int = 0
+    detail: str = ""
+    started_at: float = dataclasses.field(default_factory=time.time)
+
+
+class BaseProgressReporter:
+    def __init__(self, log_every: int = 25) -> None:
+        self.log_every = max(1, log_every)
+        self.active: PhaseState | None = None
+
+    def start_phase(self, name: str, total: int) -> None:
+        self.active = PhaseState(name=name, total=max(1, total))
+        self._on_start(self.active)
+
+    def advance(self, step: int = 1, detail: str | None = None) -> None:
+        if not self.active:
+            return
+        self.active.current = min(self.active.total, self.active.current + step)
+        if detail is not None:
+            self.active.detail = detail
+        self._on_advance(self.active)
+
+    def finish_phase(self, summary: str = "") -> None:
+        if not self.active:
+            return
+        self.active.current = self.active.total
+        self._on_finish(self.active, summary)
+        self.active = None
+
+    def close(self) -> None:
+        return
+
+    def _rate_eta(self, st: PhaseState) -> tuple[float, str]:
+        elapsed = max(0.001, time.time() - st.started_at)
+        rate = st.current / elapsed
+        if rate <= 0:
+            return 0.0, "--"
+        remaining = max(0, st.total - st.current)
+        eta_seconds = int(remaining / rate)
+        mins, secs = divmod(eta_seconds, 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            eta = f"{hours}h{mins:02d}m"
+        elif mins > 0:
+            eta = f"{mins}m{secs:02d}s"
+        else:
+            eta = f"{secs}s"
+        return rate, eta
+
+    def _truncate(self, text: str, max_len: int = 80) -> str:
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1] + "…"
+
+    def _format_line(self, st: PhaseState) -> str:
+        pct = (st.current / st.total) * 100
+        rate, eta = self._rate_eta(st)
+        base = f"{st.current}/{st.total} ({pct:5.1f}%) | {rate:4.2f}/s | ETA {eta}"
+        if st.detail:
+            base += f" | {self._truncate(st.detail)}"
+        return base
+
+    def _on_start(self, st: PhaseState) -> None:
+        raise NotImplementedError
+
+    def _on_advance(self, st: PhaseState) -> None:
+        raise NotImplementedError
+
+    def _on_finish(self, st: PhaseState, summary: str) -> None:
+        raise NotImplementedError
+
+
+class NullProgressReporter(BaseProgressReporter):
+    def _on_start(self, st: PhaseState) -> None:
+        return
+
+    def _on_advance(self, st: PhaseState) -> None:
+        return
+
+    def _on_finish(self, st: PhaseState, summary: str) -> None:
+        return
+
+
+class PlainProgressReporter(BaseProgressReporter):
+    def _on_start(self, st: PhaseState) -> None:
+        print(f"[{st.name}] start total={st.total}")
+
+    def _on_advance(self, st: PhaseState) -> None:
+        if st.current == st.total or st.current % self.log_every == 0:
+            print(f"[{st.name}] {self._format_line(st)}")
+
+    def _on_finish(self, st: PhaseState, summary: str) -> None:
+        line = self._format_line(st)
+        if summary:
+            line = f"{line} | {summary}"
+        print(f"[{st.name}] done {line}")
+
+
+class RichProgressReporter(BaseProgressReporter):
+    def __init__(self, log_every: int = 25) -> None:
+        super().__init__(log_every=log_every)
+        self.progress = (
+            Progress(
+                SpinnerColumn(),
+                TextColumn("[bold cyan]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("{task.fields[stats]}"),
+                TextColumn("{task.fields[detail]}"),
+                transient=False,
+            )
+            if Progress
+            else None
+        )
+        self.task_id: int | None = None
+        if self.progress:
+            self.progress.start()
+
+    def _on_start(self, st: PhaseState) -> None:
+        if not self.progress:
+            return
+        self.task_id = self.progress.add_task(st.name, total=st.total, stats="", detail="")
+
+    def _on_advance(self, st: PhaseState) -> None:
+        if not self.progress or self.task_id is None:
+            return
+        rate, eta = self._rate_eta(st)
+        stats = f"{st.current}/{st.total} | {rate:4.2f}/s | ETA {eta}"
+        detail = self._truncate(st.detail, max_len=90) if st.detail else ""
+        self.progress.update(self.task_id, completed=st.current, stats=stats, detail=detail)
+
+    def _on_finish(self, st: PhaseState, summary: str) -> None:
+        if not self.progress or self.task_id is None:
+            return
+        self._on_advance(st)
+        detail = summary if summary else st.detail
+        self.progress.update(self.task_id, detail=self._truncate(detail, max_len=90))
+        self.task_id = None
+
+    def close(self) -> None:
+        if self.progress:
+            self.progress.stop()
+
+
+def create_progress_reporter() -> BaseProgressReporter:
+    mode = os.getenv("PROGRESS_MODE", "auto").strip().lower()
+    log_every = int(os.getenv("PROGRESS_LOG_EVERY", "25"))
+    if mode not in {"auto", "rich", "plain", "off"}:
+        mode = "auto"
+
+    is_ci = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+    is_tty = sys.stdout.isatty()
+
+    if mode == "off":
+        return NullProgressReporter(log_every=log_every)
+
+    if is_ci and mode == "auto":
+        return NullProgressReporter(log_every=log_every)
+
+    use_rich = mode == "rich" or (mode == "auto" and is_tty and not is_ci)
+    if use_rich and Progress is None:
+        print("rich is unavailable, falling back to plain progress")
+        use_rich = False
+
+    if use_rich:
+        return RichProgressReporter(log_every=log_every)
+    return PlainProgressReporter(log_every=log_every)
+
+
+def utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso(ts: str | None) -> dt.datetime | None:
+    if not ts:
+        return None
+    t = ts.strip()
+    if not t:
+        return None
+    try:
+        return dt.datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def safe_read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def safe_write(path: Path, content: str) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_text(encoding="utf-8") == content:
+        return False
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def is_effectively_empty_export(content: str) -> bool:
+    return content.strip() in {"", "null", "[]", "{}"}
+
+
+def safe_write_export(path: Path, content: str, allow_empty_overwrite: bool = False) -> tuple[bool, bool]:
+    """Return (changed, skipped_empty_overwrite)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    if (
+        not allow_empty_overwrite
+        and path.exists()
+        and not is_effectively_empty_export(existing)
+        and is_effectively_empty_export(content)
+    ):
+        return False, True
+    return safe_write(path, content), False
+
+
+def sha256_text(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def sanitize_title_for_folder(value: str) -> str:
+    value = value.strip()
+    value = re.sub(r"\s+", "-", value)
+    value = re.sub(r"[^A-Za-z0-9_-]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-")
+    return value or "Untitled"
+
+
+def meeting_folder_name(created_at: str | None, title: str | None) -> str:
+    parsed = parse_iso(created_at)
+    date_part = parsed.strftime("%Y%m%d") if parsed else "00000000"
+    title_part = sanitize_title_for_folder(title or "Untitled")
+    return f"{date_part}_{title_part}"
+
+
+def load_config(path: Path) -> ExportConfig:
+    cfg = ExportConfig()
+    if not path.exists() or yaml is None:
+        return cfg
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    cfg.max_requests_per_second = float(raw.get("max_requests_per_second", cfg.max_requests_per_second))
+    cfg.workspace_id = raw.get("workspace_id") or None
+
+    retry = raw.get("retry") or {}
+    cfg.retry = RetryConfig(
+        max_attempts=int(retry.get("max_attempts", cfg.retry.max_attempts)),
+        backoff_seconds=[int(x) for x in retry.get("backoff_seconds", cfg.retry.backoff_seconds)],
+    )
+
+    hg = raw.get("health_guard") or {}
+    cfg.health_guard = HealthGuardConfig(
+        drop_threshold_percent=int(hg.get("drop_threshold_percent", cfg.health_guard.drop_threshold_percent)),
+        min_expected_items=int(hg.get("min_expected_items", cfg.health_guard.min_expected_items)),
+    )
+    return cfg
+
+
+def _parse_nested_json(val: Any) -> dict[str, Any] | None:
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def parse_supabase_credentials(raw_json: str, env_client_id: str | None = None) -> dict[str, str]:
+    data = json.loads(raw_json)
+
+    workos = _parse_nested_json(data.get("workos_tokens"))
+    if workos and (workos.get("access_token") or workos.get("refresh_token")):
+        return {
+            "access_token": str(workos.get("access_token") or ""),
+            "refresh_token": str(workos.get("refresh_token") or ""),
+            "client_id": str(workos.get("client_id") or env_client_id or DEFAULT_CLIENT_ID),
+        }
+
+    cognito = _parse_nested_json(data.get("cognito_tokens"))
+    if cognito and (cognito.get("access_token") or cognito.get("refresh_token")):
+        return {
+            "access_token": str(cognito.get("access_token") or ""),
+            "refresh_token": str(cognito.get("refresh_token") or ""),
+            "client_id": str(cognito.get("client_id") or env_client_id or DEFAULT_CLIENT_ID),
+        }
+
+    return {
+        "access_token": str(data.get("access_token") or ""),
+        "refresh_token": str(data.get("refresh_token") or ""),
+        "client_id": str(data.get("client_id") or env_client_id or DEFAULT_CLIENT_ID),
+    }
+
+
+class GranolaClient:
+    def __init__(
+        self,
+        api_base: str,
+        access_token: str,
+        refresh_token: str,
+        client_id: str,
+        retry_cfg: RetryConfig,
+        max_rps: float,
+    ) -> None:
+        self.api_base = api_base.rstrip("/")
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.client_id = client_id
+        self.retry_cfg = retry_cfg
+        self.min_interval = 1.0 / max(max_rps, 0.1)
+        self._last_request_at = 0.0
+
+    def _throttle(self) -> None:
+        elapsed = time.time() - self._last_request_at
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json",
+            "X-App-Version": APP_VERSION,
+            "X-Client-Version": APP_VERSION,
+            "X-Client-Type": "backup",
+            "X-Client-Platform": "github-actions",
+            "X-Client-Architecture": "x64",
+            "X-Client-Id": "granola-backup-exporter",
+            "User-Agent": "granola-backup-exporter/1.0",
+        }
+
+    def _refresh_access_token(self) -> None:
+        if not self.refresh_token:
+            raise RuntimeError("Access token expired and no refresh token available")
+
+        resp = requests.post(
+            WORKOS_AUTH_URL,
+            headers={"Content-Type": "application/json"},
+            json={
+                "client_id": self.client_id,
+                "grant_type": "refresh_token",
+                "refresh_token": self.refresh_token,
+            },
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Token refresh failed: HTTP {resp.status_code}: {resp.text[:500]}")
+
+        payload = resp.json()
+        self.access_token = str(payload.get("access_token") or "")
+        self.refresh_token = str(payload.get("refresh_token") or self.refresh_token)
+        if not self.access_token:
+            raise RuntimeError("Token refresh succeeded but no access_token returned")
+
+    def post(self, endpoint: str, body: dict[str, Any]) -> Any:
+        attempts = max(self.retry_cfg.max_attempts, 1)
+        for attempt in range(attempts):
+            self._throttle()
+            self._last_request_at = time.time()
+            try:
+                resp = requests.post(
+                    f"{self.api_base}{endpoint}",
+                    headers=self._headers(),
+                    json=body,
+                    timeout=45,
+                )
+            except requests.RequestException as err:
+                if attempt == attempts - 1:
+                    raise RuntimeError(f"Network error POST {endpoint}: {err}") from err
+                sleep_for = self.retry_cfg.backoff_seconds[min(attempt, len(self.retry_cfg.backoff_seconds) - 1)]
+                time.sleep(sleep_for)
+                continue
+
+            if resp.status_code == 401:
+                self._refresh_access_token()
+                continue
+
+            if resp.status_code in RETRYABLE_STATUSES:
+                if attempt == attempts - 1:
+                    raise RuntimeError(f"HTTP {resp.status_code} for {endpoint}: {resp.text[:500]}")
+                sleep_for = self.retry_cfg.backoff_seconds[min(attempt, len(self.retry_cfg.backoff_seconds) - 1)]
+                time.sleep(sleep_for)
+                continue
+
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code} for {endpoint}: {resp.text[:500]}")
+
+            return resp.json()
+
+        raise RuntimeError(f"Unable to complete POST {endpoint}")
+
+    def list_meetings(self, workspace_id: str | None = None) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        offset = 0
+
+        for _ in range(MAX_PAGES):
+            body: dict[str, Any] = {
+                "limit": PAGE_SIZE,
+                "offset": offset,
+                "include_last_viewed_panel": True,
+            }
+            if workspace_id:
+                body["workspace_id"] = workspace_id
+
+            data = self.post("/v2/get-documents", body)
+            docs = (data or {}).get("docs") or []
+            if not isinstance(docs, list) or not docs:
+                break
+
+            out.extend(docs)
+            if len(docs) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+
+        return out
+
+    def get_metadata(self, meeting_id: str) -> dict[str, Any]:
+        data = self.post("/v1/get-document-metadata", {"document_id": meeting_id})
+        return data if isinstance(data, dict) else {}
+
+    def get_transcript(self, meeting_id: str) -> list[dict[str, Any]]:
+        data = self.post("/v1/get-document-transcript", {"document_id": meeting_id})
+        return data if isinstance(data, list) else []
+
+
+def _render_inline(node: dict[str, Any]) -> str:
+    if node.get("type") == "text":
+        txt = str(node.get("text") or "")
+        for mark in node.get("marks") or []:
+            mtype = (mark or {}).get("type")
+            attrs = (mark or {}).get("attrs") or {}
+            if mtype == "bold":
+                txt = f"**{txt}**"
+            elif mtype == "italic":
+                txt = f"*{txt}*"
+            elif mtype == "code":
+                txt = f"`{txt}`"
+            elif mtype == "link":
+                href = attrs.get("href")
+                if href:
+                    txt = f"[{txt}]({href})"
+        return txt
+
+    if node.get("type") == "hardBreak":
+        return "\\n"
+
+    parts = [_render_inline(child) for child in (node.get("content") or [])]
+    return "".join(parts)
+
+
+def _render_blocks(nodes: list[dict[str, Any]], indent: int = 0) -> list[str]:
+    lines: list[str] = []
+
+    for node in nodes:
+        ntype = node.get("type")
+        content = node.get("content") or []
+
+        if ntype == "heading":
+            level = int((node.get("attrs") or {}).get("level", 1))
+            level = max(1, min(level, 6))
+            txt = "".join(_render_inline(c) for c in content).strip()
+            lines.extend([f"{'#' * level} {txt}".rstrip(), ""])
+        elif ntype == "paragraph":
+            txt = "".join(_render_inline(c) for c in content).strip()
+            lines.extend([txt, ""])
+        elif ntype == "bulletList":
+            for item in content:
+                item_lines = _render_blocks(item.get("content") or [], indent + 2)
+                first = True
+                for il in item_lines:
+                    if not il:
+                        continue
+                    prefix = " " * indent + ("- " if first else "  ")
+                    lines.append(prefix + il)
+                    first = False
+            lines.append("")
+        elif ntype == "orderedList":
+            idx = 1
+            for item in content:
+                item_lines = _render_blocks(item.get("content") or [], indent + 3)
+                first = True
+                for il in item_lines:
+                    if not il:
+                        continue
+                    prefix = " " * indent + (f"{idx}. " if first else "   ")
+                    lines.append(prefix + il)
+                    first = False
+                idx += 1
+            lines.append("")
+        elif ntype == "listItem":
+            lines.extend(_render_blocks(content, indent))
+        elif ntype == "blockquote":
+            q_lines = _render_blocks(content, indent)
+            for q in q_lines:
+                if q:
+                    lines.append(f"> {q}")
+            lines.append("")
+        elif ntype == "codeBlock":
+            code = "\n".join(
+                "".join(_render_inline(c) for c in ((child or {}).get("content") or [])) for child in content
+            )
+            lines.extend(["```", code, "```", ""])
+        else:
+            txt = "".join(_render_inline(c) for c in content).strip()
+            if txt:
+                lines.extend([txt, ""])
+
+    return lines
+
+
+def prosemirror_to_markdown(doc: dict[str, Any] | None) -> str:
+    if not doc or not isinstance(doc, dict):
+        return ""
+    nodes = doc.get("content") or []
+    lines = _render_blocks(nodes)
+    out = "\n".join(lines)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    return out + "\n" if out else ""
+
+
+def panel_content(obj: dict[str, Any]) -> Any:
+    panel = obj.get("last_viewed_panel")
+    if not isinstance(panel, dict):
+        return None
+    return panel.get("content")
+
+
+def enhanced_content_from(meeting: dict[str, Any], metadata: dict[str, Any]) -> Any:
+    meeting_content = panel_content(meeting)
+    if meeting_content is not None:
+        return meeting_content
+    return panel_content(metadata)
+
+
+def transcript_to_markdown(items: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for seg in items:
+        start_ts = parse_iso(seg.get("start_timestamp"))
+        ts = start_ts.strftime("%H:%M:%S") if start_ts else "00:00:00"
+        source = str(seg.get("source") or "unknown")
+        text = str(seg.get("text") or "").strip()
+        if text:
+            lines.append(f"[{ts}][{source}] {text}")
+    return "\n".join(lines).strip() + ("\n" if lines else "")
+
+
+def select_incremental_meetings(
+    meetings: list[dict[str, Any]],
+    last_seen: dt.datetime | None,
+    full_export: bool = False,
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for m in meetings:
+        updated = parse_iso(m.get("updated_at"))
+        if full_export or last_seen is None:
+            selected.append(m)
+        elif updated and updated > last_seen:
+            selected.append(m)
+    selected.sort(key=lambda m: m.get("updated_at") or "")
+    return selected
+
+
+def run() -> int:
+    repo_root = Path(__file__).resolve().parents[1]
+    if load_dotenv is not None:
+        load_dotenv(repo_root / ".env", override=False)
+
+    reporter = create_progress_reporter()
+    try:
+        backups_root = repo_root / "backups"
+        md_root = backups_root / "granola-md"
+        json_root = backups_root / "granola-json"
+        manifest_root = backups_root / "manifests"
+        manifest_root.mkdir(parents=True, exist_ok=True)
+
+        config = load_config(repo_root / "backup.config.yaml")
+
+        secret = os.getenv("GRANOLA_SUPABASE_JSON", "").strip()
+        if not secret:
+            print("Error: GRANOLA_SUPABASE_JSON is required", file=sys.stderr)
+            return 1
+
+        env_client_id = os.getenv("GRANOLA_CLIENT_ID")
+        creds = parse_supabase_credentials(secret, env_client_id=env_client_id)
+        access_token = creds.get("access_token", "")
+        refresh_token = creds.get("refresh_token", "")
+        client_id = creds.get("client_id") or DEFAULT_CLIENT_ID
+        if not access_token and not refresh_token:
+            print("Error: Could not extract access/refresh token from GRANOLA_SUPABASE_JSON", file=sys.stderr)
+            return 1
+
+        client = GranolaClient(
+            api_base=os.getenv("GRANOLA_API_BASE") or API_BASE_DEFAULT,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            retry_cfg=config.retry,
+            max_rps=config.max_requests_per_second,
+        )
+
+        sync_state_path = manifest_root / "sync_state.json"
+        prev_state = safe_read_json(sync_state_path)
+        last_seen = parse_iso(prev_state.get("last_max_updated_at_seen"))
+
+        reporter.start_phase("Discovery", 1)
+        meetings = client.list_meetings(workspace_id=os.getenv("BACKUP_WORKSPACE_ID") or config.workspace_id)
+        total_meetings = len(meetings)
+        reporter.advance(detail=f"found {total_meetings} meetings")
+        reporter.finish_phase(f"found {total_meetings} meetings")
+
+        prev_total_meetings = int(prev_state.get("last_total_meetings") or 0)
+        allow_drop = os.getenv("ALLOW_LARGE_DROP", "false").lower() == "true"
+        drop_threshold = max(0, min(100, config.health_guard.drop_threshold_percent))
+        if (
+            not allow_drop
+            and prev_total_meetings >= config.health_guard.min_expected_items
+            and total_meetings < int(prev_total_meetings * (1 - drop_threshold / 100.0))
+        ):
+            raise RuntimeError(
+                f"Health guard blocked run: total meetings dropped from {prev_total_meetings} to {total_meetings}. "
+                "Set ALLOW_LARGE_DROP=true to override."
+            )
+
+        full_export = os.getenv("FULL_EXPORT", "false").lower() == "true"
+        allow_empty_overwrite = os.getenv("ALLOW_EMPTY_CONTENT_OVERWRITE", "false").lower() == "true"
+        reporter.start_phase("Selection", 1)
+        selected = select_incremental_meetings(meetings, last_seen=last_seen, full_export=full_export)
+        reporter.advance(detail=f"selected {len(selected)} meetings")
+        reporter.finish_phase(f"selected {len(selected)} meetings")
+
+        files_written = 0
+        files_unchanged = 0
+        files_skipped_empty_overwrite = 0
+        errors: list[dict[str, str]] = []
+        exported_records: list[dict[str, Any]] = []
+        content_stats: dict[str, dict[str, int]] = {
+            "notes": {"populated": 0, "empty": 0},
+            "enhanced": {"populated": 0, "empty": 0},
+            "transcript": {"populated": 0, "empty": 0},
+        }
+        warnings: list[dict[str, str]] = []
+        used_folder_names: set[str] = set()
+
+        reporter.start_phase("Export", len(selected))
+        total_selected = len(selected)
+        for index, m in enumerate(selected, start=1):
+            meeting_id = str(m.get("id") or "").strip()
+            if not meeting_id:
+                reporter.advance(detail=f"{index}/{total_selected} skipped-invalid-id")
+                continue
+
+            title = str(m.get("title") or "Untitled")
+            folder_name = meeting_folder_name(m.get("created_at"), title)
+            if folder_name in used_folder_names:
+                folder_name = f"{folder_name}--{meeting_id[:8]}"
+            used_folder_names.add(folder_name)
+
+            md_dir = md_root / folder_name
+            js_dir = json_root / folder_name
+
+            try:
+                metadata = client.get_metadata(meeting_id)
+                transcript = client.get_transcript(meeting_id)
+
+                notes_raw = metadata.get("notes")
+                enhanced_raw = enhanced_content_from(m, metadata)
+
+                notes_md = prosemirror_to_markdown(notes_raw if isinstance(notes_raw, dict) else None)
+                enhanced_md = prosemirror_to_markdown(enhanced_raw if isinstance(enhanced_raw, dict) else None)
+                transcript_md = transcript_to_markdown(transcript)
+
+                meeting_warnings: list[str] = []
+                if notes_md.strip():
+                    content_stats["notes"]["populated"] += 1
+                else:
+                    content_stats["notes"]["empty"] += 1
+
+                if enhanced_md.strip():
+                    content_stats["enhanced"]["populated"] += 1
+                else:
+                    content_stats["enhanced"]["empty"] += 1
+                    meeting_warnings.append("missing-enhanced-content")
+
+                if transcript_md.strip():
+                    content_stats["transcript"]["populated"] += 1
+                else:
+                    content_stats["transcript"]["empty"] += 1
+                    meeting_warnings.append("missing-transcript-content")
+
+                meeting_snapshot = {
+                    "id": meeting_id,
+                    "title": title,
+                    "created_at": m.get("created_at"),
+                    "updated_at": m.get("updated_at"),
+                    "workspace_id": m.get("workspace_id"),
+                    "people": metadata.get("people"),
+                    "creator": metadata.get("creator"),
+                    "attendees": metadata.get("attendees"),
+                }
+
+                outputs: list[tuple[Path, str]] = [
+                    (md_dir / "notes.md", notes_md),
+                    (md_dir / "enhanced.md", enhanced_md),
+                    (md_dir / "transcript.md", transcript_md),
+                    (js_dir / "notes.json", json.dumps(notes_raw, ensure_ascii=False, indent=2) + "\n"),
+                    (js_dir / "enhanced.json", json.dumps(enhanced_raw, ensure_ascii=False, indent=2) + "\n"),
+                    (js_dir / "transcript.json", json.dumps(transcript, ensure_ascii=False, indent=2) + "\n"),
+                    (js_dir / "meeting.json", json.dumps(meeting_snapshot, ensure_ascii=False, indent=2) + "\n"),
+                ]
+
+                file_info: list[dict[str, str]] = []
+                for path, content in outputs:
+                    changed, skipped = safe_write_export(
+                        path,
+                        content,
+                        allow_empty_overwrite=allow_empty_overwrite,
+                    )
+                    if skipped:
+                        files_skipped_empty_overwrite += 1
+                        status = "skipped_empty_overwrite"
+                    elif changed:
+                        status = "written"
+                    else:
+                        status = "unchanged"
+
+                    if changed:
+                        files_written += 1
+                    elif not skipped:
+                        files_unchanged += 1
+
+                    written_content = path.read_text(encoding="utf-8") if skipped and path.exists() else content
+                    item = {
+                        "path": str(path.relative_to(repo_root)),
+                        "sha256": sha256_text(written_content),
+                        "status": status,
+                    }
+                    file_info.append(item)
+
+                for warning in meeting_warnings:
+                    warnings.append({"id": meeting_id, "folder_name": folder_name, "warning": warning})
+
+                exported_records.append(
+                    {
+                        "id": meeting_id,
+                        "folder_name": folder_name,
+                        "updated_at": m.get("updated_at"),
+                        "files": file_info,
+                        "warnings": meeting_warnings,
+                    }
+                )
+                reporter.advance(detail=f"{index}/{total_selected} {folder_name}")
+            except Exception as err:
+                errors.append({"id": meeting_id, "error": str(err)})
+                reporter.advance(detail=f"{index}/{total_selected} failed {folder_name}")
+
+        reporter.finish_phase(f"ok={len(exported_records)} failed={len(errors)}")
+
+        all_updated = [parse_iso((m or {}).get("updated_at")) for m in meetings]
+        all_updated = [x for x in all_updated if x is not None]
+        max_seen = (
+            max(all_updated).isoformat().replace("+00:00", "Z") if all_updated else prev_state.get("last_max_updated_at_seen")
+        )
+
+        manifest = {
+            "generated_at": utc_now_iso(),
+            "totals": {
+                "meetings_discovered": total_meetings,
+                "meetings_selected": len(selected),
+                "meetings_exported": len(exported_records),
+                "files_written": files_written,
+                "files_unchanged": files_unchanged,
+                "files_skipped_empty_overwrite": files_skipped_empty_overwrite,
+            },
+            "content": content_stats,
+            "run": {
+                "errors_count": len(errors),
+                "full_export": full_export,
+                "allow_empty_content_overwrite": allow_empty_overwrite,
+            },
+            "meetings": exported_records,
+            "warnings": warnings,
+            "errors": errors,
+        }
+
+        reporter.start_phase("Finalize", 1)
+        manifest_path = manifest_root / "manifest.json"
+        safe_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+
+        if errors:
+            reporter.advance(detail="completed with errors")
+            reporter.finish_phase("completed with errors")
+            print(f"Export completed with {len(errors)} errors", file=sys.stderr)
+            return 1
+
+        new_state = {
+            "last_successful_sync_utc": utc_now_iso(),
+            "last_max_updated_at_seen": max_seen,
+            "last_total_meetings": total_meetings,
+        }
+        safe_write(sync_state_path, json.dumps(new_state, ensure_ascii=False, indent=2) + "\n")
+        reporter.advance(detail="manifest and sync state written")
+        reporter.finish_phase("manifest and sync state written")
+
+        print(
+            json.dumps(
+                {
+                    "meetings_discovered": total_meetings,
+                    "meetings_selected": len(selected),
+                    "meetings_exported": len(exported_records),
+                    "files_written": files_written,
+                    "files_unchanged": files_unchanged,
+                    "files_skipped_empty_overwrite": files_skipped_empty_overwrite,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
+    finally:
+        reporter.close()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(run())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

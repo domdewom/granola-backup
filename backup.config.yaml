@@ -1,0 +1,8 @@
+max_requests_per_second: 2
+workspace_id: null
+retry:
+  max_attempts: 6
+  backoff_seconds: [2, 5, 15, 30, 60]
+health_guard:
+  drop_threshold_percent: 60
+  min_expected_items: 3

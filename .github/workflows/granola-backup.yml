@@ -1,0 +1,90 @@
+name: Granola Backup
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: granola-backup
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GRANOLA_SUPABASE_JSON: ${{ secrets.GRANOLA_SUPABASE_JSON }}
+      GRANOLA_CLIENT_ID: ${{ secrets.GRANOLA_CLIENT_ID }}
+      GRANOLA_API_BASE: ${{ secrets.GRANOLA_API_BASE }}
+      BACKUP_WORKSPACE_ID: ${{ secrets.BACKUP_WORKSPACE_ID }}
+      ALLOW_LARGE_DROP: ${{ secrets.ALLOW_LARGE_DROP }}
+      ALLOW_EMPTY_CONTENT_OVERWRITE: ${{ secrets.ALLOW_EMPTY_CONTENT_OVERWRITE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore previous backup state
+        run: |
+          set -euo pipefail
+          BACKUP_BRANCH="granola-backups"
+
+          if git ls-remote --exit-code --heads origin "${BACKUP_BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BACKUP_BRANCH}"
+            if git cat-file -e FETCH_HEAD:backups 2>/dev/null; then
+              git restore --source=FETCH_HEAD --worktree -- backups
+            else
+              echo "${BACKUP_BRANCH} exists but has no backups directory; starting from scratch"
+            fi
+          else
+            echo "No existing ${BACKUP_BRANCH} branch; starting from scratch"
+          fi
+
+      - name: Export Granola backups
+        run: python scripts/export_granola.py
+
+      - name: Publish backups to backup branch
+        run: |
+          set -euo pipefail
+          BACKUP_BRANCH="granola-backups"
+          PUBLISH_DIR="$(mktemp -d)"
+
+          cp -a backups "${PUBLISH_DIR}/backups"
+
+          git config user.name "granola-backup-bot"
+          git config user.email "granola-backup-bot@users.noreply.github.com"
+
+          if git ls-remote --exit-code --heads origin "${BACKUP_BRANCH}" >/dev/null 2>&1; then
+            git fetch origin "${BACKUP_BRANCH}"
+            git switch --detach FETCH_HEAD
+            git switch -C "${BACKUP_BRANCH}"
+          else
+            git switch --orphan "${BACKUP_BRANCH}"
+          fi
+
+          git rm -r --ignore-unmatch -q .
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "${PUBLISH_DIR}/backups" ./backups
+
+          git add -A backups
+
+          if git diff --cached --quiet; then
+            echo "No backup changes to commit"
+            exit 0
+          fi
+
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          git commit -m "backup: granola snapshot ${TS}"
+          git push origin "${BACKUP_BRANCH}"

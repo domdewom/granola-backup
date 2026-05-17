@@ -15,11 +15,13 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import hashlib
+import html
 import json
 import os
 import re
 import sys
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -42,10 +44,12 @@ except Exception:  # pragma: no cover
 
 
 API_BASE_DEFAULT = "https://api.granola.ai"
+PUBLIC_API_BASE_DEFAULT = "https://public-api.granola.ai"
 WORKOS_AUTH_URL = "https://api.workos.com/user_management/authenticate"
 DEFAULT_CLIENT_ID = "client_GranolaMac"
 APP_VERSION = "7.0.0"
 PAGE_SIZE = 100
+PUBLIC_API_PAGE_SIZE = 30
 MAX_PAGES = 1000
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
@@ -374,6 +378,14 @@ def parse_supabase_credentials(raw_json: str, env_client_id: str | None = None) 
     }
 
 
+def select_provider(api_key: str, supabase_json: str) -> str | None:
+    if api_key.strip():
+        return "official"
+    if supabase_json.strip():
+        return "internal"
+    return None
+
+
 class GranolaClient:
     def __init__(
         self,
@@ -504,6 +516,96 @@ class GranolaClient:
         return data if isinstance(data, list) else []
 
 
+class OfficialGranolaClient:
+    def __init__(
+        self,
+        api_base: str,
+        api_key: str,
+        retry_cfg: RetryConfig,
+        max_rps: float,
+    ) -> None:
+        self.api_base = api_base.rstrip("/")
+        self.api_key = api_key
+        self.retry_cfg = retry_cfg
+        self.min_interval = 1.0 / max(max_rps, 0.1)
+        self._last_request_at = 0.0
+
+    def _throttle(self) -> None:
+        elapsed = time.time() - self._last_request_at
+        if elapsed < self.min_interval:
+            time.sleep(self.min_interval - elapsed)
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Accept": "application/json",
+            "User-Agent": "granola-backup-exporter/1.0",
+        }
+
+    def get(self, endpoint: str, params: dict[str, Any] | None = None) -> Any:
+        attempts = max(self.retry_cfg.max_attempts, 1)
+        for attempt in range(attempts):
+            self._throttle()
+            self._last_request_at = time.time()
+            try:
+                resp = requests.get(
+                    f"{self.api_base}{endpoint}",
+                    headers=self._headers(),
+                    params=params,
+                    timeout=45,
+                )
+            except requests.RequestException as err:
+                if attempt == attempts - 1:
+                    raise RuntimeError(f"Network error GET {endpoint}: {err}") from err
+                sleep_for = self.retry_cfg.backoff_seconds[min(attempt, len(self.retry_cfg.backoff_seconds) - 1)]
+                time.sleep(sleep_for)
+                continue
+
+            if resp.status_code in RETRYABLE_STATUSES:
+                if attempt == attempts - 1:
+                    raise RuntimeError(f"HTTP {resp.status_code} for {endpoint}: {resp.text[:500]}")
+                sleep_for = self.retry_cfg.backoff_seconds[min(attempt, len(self.retry_cfg.backoff_seconds) - 1)]
+                time.sleep(sleep_for)
+                continue
+
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code} for {endpoint}: {resp.text[:500]}")
+
+            return resp.json()
+
+        raise RuntimeError(f"Unable to complete GET {endpoint}")
+
+    def list_meetings(self, workspace_id: str | None = None) -> list[dict[str, Any]]:
+        if workspace_id:
+            print("Warning: BACKUP_WORKSPACE_ID is ignored when using the official Granola API", file=sys.stderr)
+
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        for _ in range(MAX_PAGES):
+            params: dict[str, Any] = {"page_size": PUBLIC_API_PAGE_SIZE}
+            if cursor:
+                params["cursor"] = cursor
+
+            data = self.get("/v1/notes", params=params)
+            notes = (data or {}).get("notes") or []
+            if not isinstance(notes, list) or not notes:
+                break
+
+            out.extend(notes)
+            if not data.get("hasMore"):
+                break
+
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+
+        return out
+
+    def get_note(self, note_id: str) -> dict[str, Any]:
+        data = self.get(f"/v1/notes/{note_id}", params={"include": "transcript"})
+        return data if isinstance(data, dict) else {}
+
+
 def _render_inline(node: dict[str, Any]) -> str:
     if node.get("type") == "text":
         txt = str(node.get("text") or "")
@@ -599,6 +701,158 @@ def prosemirror_to_markdown(doc: dict[str, Any] | None) -> str:
     return out + "\n" if out else ""
 
 
+def _looks_like_html(value: str) -> bool:
+    return bool(re.search(r"</?[a-zA-Z][^>]*>", value))
+
+
+def _normalize_markdown(text: str) -> str:
+    lines: list[str] = []
+    blank = False
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if line.strip():
+            lines.append(line)
+            blank = False
+        elif not blank and lines:
+            lines.append("")
+            blank = True
+    out = "\n".join(lines).strip()
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out + "\n" if out else ""
+
+
+class _HTMLToMarkdownParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.list_stack: list[dict[str, int | str]] = []
+        self.link_stack: list[tuple[str, int]] = []
+        self.in_pre = False
+
+    def _text(self) -> str:
+        return "".join(self.parts)
+
+    def _endswith(self, suffix: str) -> bool:
+        return self._text().endswith(suffix)
+
+    def _append(self, value: str) -> None:
+        self.parts.append(value)
+
+    def _block_break(self) -> None:
+        if not self.parts:
+            return
+        if self._endswith("\n\n"):
+            return
+        if self._endswith("\n"):
+            self._append("\n")
+        else:
+            self._append("\n\n")
+
+    def _line_break(self) -> None:
+        if not self._endswith("\n"):
+            self._append("\n")
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = {key: value for key, value in attrs}
+        if tag in {"p", "div", "section", "article"}:
+            self._block_break()
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self._block_break()
+            level = int(tag[1])
+            self._append(f"{'#' * level} ")
+        elif tag == "br":
+            self._line_break()
+        elif tag == "hr":
+            self._block_break()
+            self._append("---")
+            self._block_break()
+        elif tag == "ul":
+            self._block_break()
+            self.list_stack.append({"type": "ul", "index": 0})
+        elif tag == "ol":
+            self._block_break()
+            self.list_stack.append({"type": "ol", "index": 0})
+        elif tag == "li":
+            self._line_break()
+            indent = "  " * max(len(self.list_stack) - 1, 0)
+            if self.list_stack and self.list_stack[-1]["type"] == "ol":
+                self.list_stack[-1]["index"] = int(self.list_stack[-1]["index"]) + 1
+                prefix = f"{self.list_stack[-1]['index']}. "
+            else:
+                prefix = "- "
+            self._append(indent + prefix)
+        elif tag in {"strong", "b"}:
+            self._append("**")
+        elif tag in {"em", "i"}:
+            self._append("*")
+        elif tag == "code" and not self.in_pre:
+            self._append("`")
+        elif tag == "pre":
+            self._block_break()
+            self._append("```\n")
+            self.in_pre = True
+        elif tag == "blockquote":
+            self._block_break()
+            self._append("> ")
+        elif tag == "a":
+            self.link_stack.append((attrs_dict.get("href") or "", len(self.parts)))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"strong", "b"}:
+            self._append("**")
+        elif tag in {"em", "i"}:
+            self._append("*")
+        elif tag == "code" and not self.in_pre:
+            self._append("`")
+        elif tag == "a" and self.link_stack:
+            href, start = self.link_stack.pop()
+            if href:
+                label = "".join(self.parts[start:]).strip()
+                self.parts[start:] = [f"[{label}]({href})" if label else href]
+        elif tag == "pre":
+            if not self._endswith("\n"):
+                self._append("\n")
+            self._append("```")
+            self.in_pre = False
+            self._block_break()
+        elif tag in {"h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "section", "article", "blockquote"}:
+            self._block_break()
+        elif tag == "li":
+            self._line_break()
+        elif tag in {"ul", "ol"}:
+            if self.list_stack:
+                self.list_stack.pop()
+            self._block_break()
+
+    def handle_data(self, data: str) -> None:
+        if self.in_pre:
+            self._append(data)
+            return
+        text = re.sub(r"\s+", " ", html.unescape(data))
+        if text:
+            self._append(text)
+
+
+def html_to_markdown(value: str) -> str:
+    parser = _HTMLToMarkdownParser()
+    parser.feed(value)
+    parser.close()
+    return _normalize_markdown("".join(parser.parts))
+
+
+def enhanced_to_markdown(value: Any) -> str:
+    if isinstance(value, dict):
+        return prosemirror_to_markdown(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        if _looks_like_html(text):
+            return html_to_markdown(text)
+        return _normalize_markdown(html.unescape(text))
+    return ""
+
+
 def panel_content(obj: dict[str, Any]) -> Any:
     panel = obj.get("last_viewed_panel")
     if not isinstance(panel, dict):
@@ -613,16 +867,59 @@ def enhanced_content_from(meeting: dict[str, Any], metadata: dict[str, Any]) -> 
     return panel_content(metadata)
 
 
+def summary_to_markdown(summary_markdown: Any, summary_text: Any) -> str:
+    if isinstance(summary_markdown, str) and summary_markdown.strip():
+        return _normalize_markdown(summary_markdown)
+    if isinstance(summary_text, str) and summary_text.strip():
+        return _normalize_markdown(summary_text)
+    return ""
+
+
+def transcript_source(seg: dict[str, Any]) -> str:
+    if seg.get("source"):
+        return str(seg.get("source") or "unknown")
+    speaker = seg.get("speaker")
+    if isinstance(speaker, dict):
+        return str(speaker.get("name") or speaker.get("email") or speaker.get("source") or "unknown")
+    return "unknown"
+
+
 def transcript_to_markdown(items: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for seg in items:
-        start_ts = parse_iso(seg.get("start_timestamp"))
+        start_ts = parse_iso(seg.get("start_timestamp") or seg.get("start_time"))
         ts = start_ts.strftime("%H:%M:%S") if start_ts else "00:00:00"
-        source = str(seg.get("source") or "unknown")
+        source = transcript_source(seg)
         text = str(seg.get("text") or "").strip()
         if text:
             lines.append(f"[{ts}][{source}] {text}")
     return "\n".join(lines).strip() + ("\n" if lines else "")
+
+
+def build_folders_manifest(records: list[dict[str, Any]]) -> dict[str, Any]:
+    folders: dict[str, dict[str, Any]] = {}
+    for record in records:
+        note_id = record.get("id")
+        folder_name = record.get("folder_name")
+        for folder in record.get("folder_membership") or []:
+            if not isinstance(folder, dict):
+                continue
+            fid = str(folder.get("id") or folder.get("name") or "unknown")
+            item = folders.setdefault(
+                fid,
+                {
+                    "id": folder.get("id"),
+                    "object": folder.get("object"),
+                    "name": folder.get("name"),
+                    "note_count": 0,
+                    "notes": [],
+                },
+            )
+            item["note_count"] += 1
+            item["notes"].append({"id": note_id, "folder_name": folder_name})
+
+    ordered = sorted(folders.values(), key=lambda item: str(item.get("name") or item.get("id") or ""))
+    return {"generated_at": utc_now_iso(), "folders": ordered}
 
 
 def select_incremental_meetings(
@@ -656,28 +953,42 @@ def run() -> int:
 
         config = load_config(repo_root / "backup.config.yaml")
 
+        official_api_key = os.getenv("GRANOLA_API_KEY", "").strip()
         secret = os.getenv("GRANOLA_SUPABASE_JSON", "").strip()
-        if not secret:
-            print("Error: GRANOLA_SUPABASE_JSON is required", file=sys.stderr)
-            return 1
+        provider = select_provider(official_api_key, secret)
 
-        env_client_id = os.getenv("GRANOLA_CLIENT_ID")
-        creds = parse_supabase_credentials(secret, env_client_id=env_client_id)
-        access_token = creds.get("access_token", "")
-        refresh_token = creds.get("refresh_token", "")
-        client_id = creds.get("client_id") or DEFAULT_CLIENT_ID
-        if not access_token and not refresh_token:
-            print("Error: Could not extract access/refresh token from GRANOLA_SUPABASE_JSON", file=sys.stderr)
-            return 1
+        if provider == "official":
+            client: Any = OfficialGranolaClient(
+                api_base=os.getenv("GRANOLA_PUBLIC_API_BASE") or PUBLIC_API_BASE_DEFAULT,
+                api_key=official_api_key,
+                retry_cfg=config.retry,
+                max_rps=config.max_requests_per_second,
+            )
+        elif provider == "internal":
+            if not secret:
+                print("Error: GRANOLA_API_KEY is required. GRANOLA_SUPABASE_JSON is supported as a fallback.", file=sys.stderr)
+                return 1
 
-        client = GranolaClient(
-            api_base=os.getenv("GRANOLA_API_BASE") or API_BASE_DEFAULT,
-            access_token=access_token,
-            refresh_token=refresh_token,
-            client_id=client_id,
-            retry_cfg=config.retry,
-            max_rps=config.max_requests_per_second,
-        )
+            env_client_id = os.getenv("GRANOLA_CLIENT_ID")
+            creds = parse_supabase_credentials(secret, env_client_id=env_client_id)
+            access_token = creds.get("access_token", "")
+            refresh_token = creds.get("refresh_token", "")
+            client_id = creds.get("client_id") or DEFAULT_CLIENT_ID
+            if not access_token and not refresh_token:
+                print("Error: Could not extract access/refresh token from GRANOLA_SUPABASE_JSON", file=sys.stderr)
+                return 1
+
+            client = GranolaClient(
+                api_base=os.getenv("GRANOLA_API_BASE") or API_BASE_DEFAULT,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                client_id=client_id,
+                retry_cfg=config.retry,
+                max_rps=config.max_requests_per_second,
+            )
+        else:
+            print("Error: GRANOLA_API_KEY is required. GRANOLA_SUPABASE_JSON is supported as a fallback.", file=sys.stderr)
+            return 1
 
         sync_state_path = manifest_root / "sync_state.json"
         prev_state = safe_read_json(sync_state_path)
@@ -740,15 +1051,60 @@ def run() -> int:
             js_dir = json_root / folder_name
 
             try:
-                metadata = client.get_metadata(meeting_id)
-                transcript = client.get_transcript(meeting_id)
+                extra_outputs: list[tuple[Path, str]] = []
+                folder_membership: list[dict[str, Any]] = []
 
-                notes_raw = metadata.get("notes")
-                enhanced_raw = enhanced_content_from(m, metadata)
+                if provider == "official":
+                    note = client.get_note(meeting_id)
+                    transcript = note.get("transcript") if isinstance(note.get("transcript"), list) else []
+                    notes_raw = None
+                    enhanced_raw = {
+                        "summary": note.get("summary"),
+                        "summary_text": note.get("summary_text"),
+                        "summary_markdown": note.get("summary_markdown"),
+                    }
+                    notes_md = ""
+                    enhanced_md = summary_to_markdown(
+                        note.get("summary_markdown"),
+                        note.get("summary_text") or note.get("summary"),
+                    )
+                    transcript_md = transcript_to_markdown(transcript)
+                    folder_membership = [
+                        item for item in (note.get("folder_membership") or []) if isinstance(item, dict)
+                    ]
+                    meeting_snapshot = {
+                        "id": meeting_id,
+                        "object": note.get("object"),
+                        "title": note.get("title"),
+                        "created_at": note.get("created_at"),
+                        "updated_at": note.get("updated_at"),
+                        "web_url": note.get("web_url"),
+                        "owner": note.get("owner"),
+                        "calendar_event": note.get("calendar_event"),
+                        "attendees": note.get("attendees"),
+                        "folder_membership": folder_membership,
+                    }
+                    extra_outputs.append((js_dir / "note.json", json.dumps(note, ensure_ascii=False, indent=2) + "\n"))
+                else:
+                    metadata = client.get_metadata(meeting_id)
+                    transcript = client.get_transcript(meeting_id)
 
-                notes_md = prosemirror_to_markdown(notes_raw if isinstance(notes_raw, dict) else None)
-                enhanced_md = prosemirror_to_markdown(enhanced_raw if isinstance(enhanced_raw, dict) else None)
-                transcript_md = transcript_to_markdown(transcript)
+                    notes_raw = metadata.get("notes")
+                    enhanced_raw = enhanced_content_from(m, metadata)
+
+                    notes_md = prosemirror_to_markdown(notes_raw if isinstance(notes_raw, dict) else None)
+                    enhanced_md = enhanced_to_markdown(enhanced_raw)
+                    transcript_md = transcript_to_markdown(transcript)
+                    meeting_snapshot = {
+                        "id": meeting_id,
+                        "title": title,
+                        "created_at": m.get("created_at"),
+                        "updated_at": m.get("updated_at"),
+                        "workspace_id": m.get("workspace_id"),
+                        "people": metadata.get("people"),
+                        "creator": metadata.get("creator"),
+                        "attendees": metadata.get("attendees"),
+                    }
 
                 meeting_warnings: list[str] = []
                 if notes_md.strip():
@@ -768,17 +1124,6 @@ def run() -> int:
                     content_stats["transcript"]["empty"] += 1
                     meeting_warnings.append("missing-transcript-content")
 
-                meeting_snapshot = {
-                    "id": meeting_id,
-                    "title": title,
-                    "created_at": m.get("created_at"),
-                    "updated_at": m.get("updated_at"),
-                    "workspace_id": m.get("workspace_id"),
-                    "people": metadata.get("people"),
-                    "creator": metadata.get("creator"),
-                    "attendees": metadata.get("attendees"),
-                }
-
                 outputs: list[tuple[Path, str]] = [
                     (md_dir / "notes.md", notes_md),
                     (md_dir / "enhanced.md", enhanced_md),
@@ -788,6 +1133,7 @@ def run() -> int:
                     (js_dir / "transcript.json", json.dumps(transcript, ensure_ascii=False, indent=2) + "\n"),
                     (js_dir / "meeting.json", json.dumps(meeting_snapshot, ensure_ascii=False, indent=2) + "\n"),
                 ]
+                outputs.extend(extra_outputs)
 
                 file_info: list[dict[str, str]] = []
                 for path, content in outputs:
@@ -825,6 +1171,7 @@ def run() -> int:
                         "id": meeting_id,
                         "folder_name": folder_name,
                         "updated_at": m.get("updated_at"),
+                        "folder_membership": folder_membership,
                         "files": file_info,
                         "warnings": meeting_warnings,
                     }
@@ -854,6 +1201,7 @@ def run() -> int:
             },
             "content": content_stats,
             "run": {
+                "provider": provider,
                 "errors_count": len(errors),
                 "full_export": full_export,
                 "allow_empty_content_overwrite": allow_empty_overwrite,
@@ -866,6 +1214,9 @@ def run() -> int:
         reporter.start_phase("Finalize", 1)
         manifest_path = manifest_root / "manifest.json"
         safe_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        if provider == "official":
+            folders_path = manifest_root / "folders.json"
+            safe_write(folders_path, json.dumps(build_folders_manifest(exported_records), ensure_ascii=False, indent=2) + "\n")
 
         if errors:
             reporter.advance(detail="completed with errors")

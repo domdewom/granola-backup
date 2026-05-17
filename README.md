@@ -1,7 +1,7 @@
 # Granola Backup Exporter
 
 Daily incremental backup for Granola meetings. The exporter writes generated
-artifacts locally under `backups/`; those generated artifacts are ignored on
+artifacts in the repo under `backups`; those generated artifacts are ignored on
 `main` by default.
 
 This exporter uses the official Granola API when `GRANOLA_API_KEY` is

@@ -17,8 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
+      GRANOLA_API_KEY: ${{ secrets.GRANOLA_API_KEY }}
       GRANOLA_SUPABASE_JSON: ${{ secrets.GRANOLA_SUPABASE_JSON }}
       GRANOLA_CLIENT_ID: ${{ secrets.GRANOLA_CLIENT_ID }}
+      GRANOLA_PUBLIC_API_BASE: ${{ secrets.GRANOLA_PUBLIC_API_BASE }}
       GRANOLA_API_BASE: ${{ secrets.GRANOLA_API_BASE }}
       BACKUP_WORKSPACE_ID: ${{ secrets.BACKUP_WORKSPACE_ID }}
       ALLOW_LARGE_DROP: ${{ secrets.ALLOW_LARGE_DROP }}
@@ -31,8 +33,8 @@ jobs:
       - name: Check setup
         id: setup
         run: |
-          if [ -z "${GRANOLA_SUPABASE_JSON:-}" ]; then
-            echo "::notice title=Granola backup not configured::Add the GRANOLA_SUPABASE_JSON repository secret in Settings > Secrets and variables > Actions, then rerun this workflow."
+          if [ -z "${GRANOLA_API_KEY:-}" ] && [ -z "${GRANOLA_SUPABASE_JSON:-}" ]; then
+            echo "::notice title=Granola backup not configured::Add the GRANOLA_API_KEY repository secret in Settings > Secrets and variables > Actions, then rerun this workflow. GRANOLA_SUPABASE_JSON is still supported as a fallback."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"

@@ -1,12 +1,13 @@
 # Granola Backup Exporter
 
-This is a [Granola.ai](https://www.granola.ai/) meetings export script best used
-to daily incrementally back up meetings to your GitHub. The exporter writes
-generated artifacts into the `granola-backups` branch. Locally, artifacts are
-stored under `backups/`, but ignored on `main` by default.
+Daily incremental backup for Granola meetings. The exporter writes generated
+artifacts locally under `backups/`; those generated artifacts are ignored on
+`main` by default.
 
-This is an unofficial exporter that relies on Granola API behavior observed
-from the desktop app. It is not affiliated with or endorsed by Granola.
+This exporter uses the official Granola API when `GRANOLA_API_KEY` is
+configured. It can also fall back to Granola API behavior observed from the
+desktop app via `GRANOLA_SUPABASE_JSON`. It is not affiliated with or endorsed
+by Granola.
 
 For each meeting, it exports:
 
@@ -29,14 +30,14 @@ your GitHub Secrets and backup data are not.
 Recommended setup:
 
 1. Create a new private repo from this template.
-2. Add the `GRANOLA_SUPABASE_JSON` repository secret.
+2. Add the `GRANOLA_API_KEY` repository secret.
 3. Run the `Granola Backup` workflow manually once from the Actions tab.
 4. Keep `main` for code and config.
 5. Let the workflow publish generated backups to the `granola-backups` branch.
 
 The workflow is intentionally included in the template. If it runs before
-`GRANOLA_SUPABASE_JSON` is configured, it exits successfully with a setup notice
-and does not create backup files or branches.
+`GRANOLA_API_KEY` or the fallback `GRANOLA_SUPABASE_JSON` is configured, it exits
+successfully with a setup notice and does not create backup files or branches.
 
 ## Privacy and Security
 
@@ -56,6 +57,7 @@ sensitive data.
 - `.github/workflows/granola-backup.yml`: daily workflow
 - `backup.config.yaml`: runtime config
 - `backups/`: generated output artifacts and manifests, ignored by Git
+- `analysis/`: local analysis workspace, ignored by Git
 
 Export paths:
 
@@ -65,9 +67,9 @@ Export paths:
 
 ## Generated Artifacts and Git
 
-- `backups/` is ignored in `.gitignore`.
+- `backups/` and `analysis/` are ignored in `.gitignore`.
 - Existing backup files have been removed from Git tracking with `git rm --cached`; the files can still exist locally.
-- Moving `backups/` out of this repo will not remove tracked files from Git, because it is not currently tracked.
+- Moving `backups/` or `analysis/` out of this repo will not remove tracked files from Git, because neither folder is currently tracked.
 - The exporter always recreates `backups/` inside the repo on the next run. If `backups/manifests/sync_state.json` is moved away, the next run has no incremental marker and behaves like a first export.
 
 ## GitHub Actions Backup Branch
@@ -84,17 +86,25 @@ branch.
 
 ## Required GitHub Secret
 
+- `GRANOLA_API_KEY`: official Granola API key from Granola **Settings** -> **API**
+
+## Fallback GitHub Secret
+
 - `GRANOLA_SUPABASE_JSON`: full contents of your Granola `supabase.json`
 
 On macOS, this file is typically at:
 
 - `~/Library/Application Support/Granola/supabase.json`
 
+If both `GRANOLA_API_KEY` and `GRANOLA_SUPABASE_JSON` are present, the exporter
+uses `GRANOLA_API_KEY`.
+
 ## Optional Secrets
 
+- `GRANOLA_PUBLIC_API_BASE`: override official API base (default: `https://public-api.granola.ai`)
 - `GRANOLA_CLIENT_ID`: override client id (default: `client_GranolaMac`)
 - `GRANOLA_API_BASE`: override API base (default: `https://api.granola.ai`)
-- `BACKUP_WORKSPACE_ID`: restrict backup to a single workspace
+- `BACKUP_WORKSPACE_ID`: restrict backup to a single workspace when using the Supabase fallback
 - `ALLOW_LARGE_DROP`: set to `true` to bypass health guard if meeting count drops unexpectedly
 - `ALLOW_EMPTY_CONTENT_OVERWRITE`: set to `true` to allow empty/null API responses to overwrite existing non-empty export files
 
@@ -107,7 +117,8 @@ pip install -r requirements.txt
 
 # one-time setup
 cp .env.example .env
-# then paste your real supabase.json content into GRANOLA_SUPABASE_JSON in .env
+# then paste your Granola API key into GRANOLA_API_KEY in .env
+# fallback: paste your real supabase.json content into GRANOLA_SUPABASE_JSON in .env
 
 # run (script auto-loads .env)
 python scripts/export_granola.py
@@ -116,15 +127,15 @@ python scripts/export_granola.py
 ## GitHub Actions Setup
 
 The workflow can run on a schedule or manually from the Actions tab. It expects
-the `GRANOLA_SUPABASE_JSON` repository secret to be present. Without that
-secret, the workflow skips cleanly and prints a setup notice.
+the `GRANOLA_API_KEY` repository secret to be present. Without an API key or
+fallback Supabase secret, the workflow skips cleanly and prints a setup notice.
 
 To add the secret:
 
 1. Open your GitHub repo.
 2. Go to **Settings** -> **Secrets and variables** -> **Actions**.
-3. Add a new repository secret named `GRANOLA_SUPABASE_JSON`.
-4. Paste the full contents of your local Granola `supabase.json` file.
+3. Add a new repository secret named `GRANOLA_API_KEY`.
+4. Paste the API key from Granola **Settings** -> **API**.
 
 The workflow is scheduled with:
 

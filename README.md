@@ -1,7 +1,7 @@
 # Granola Backup Exporter
 
 Daily incremental backup for Granola meetings. The exporter writes generated
-artifacts in the repo under `backups`; those generated artifacts are ignored on
+artifacts  in the repo under `backups`; those generated artifacts are ignored on
 `main` by default.
 
 This exporter uses the official Granola API when `GRANOLA_API_KEY` is
@@ -19,7 +19,16 @@ For each meeting, it exports:
 Meeting folder naming:
 
 - `YYYYMMDD_Title` (example: `20260303_Allie`)
-- if two meetings collide on same date/title, exporter appends `--<id8>`
+- if two meetings collide on same date/title within the same parent folder, exporter appends `--<id8>`
+
+Folder structure mirrors Granola:
+
+- A meeting's directory lives under its primary Granola folder, e.g. `backups/granola-md/Future/20260427_Dominic-Anton/`.
+- Notes not assigned to a Granola folder live in `_unfiled/`.
+- When a note is in multiple folders, the lowest folder id wins (deterministic across runs); the full membership is recorded in each meeting's frontmatter and in `backups/manifests/folders.json`.
+- When a meeting is reassigned in Granola, the next run moves it to the new folder and prunes the old directory — provided Granola bumped the note's `updated_at` (which it normally does on folder moves). If a move ever doesn't propagate, run `FULL_EXPORT=true python scripts/export_granola.py`.
+
+Each exported markdown file starts with a YAML frontmatter block carrying the meeting's id, title, timestamps, web_url, folder membership, and attendees — so any `.md` is self-describing in tools like Obsidian.
 
 ## Use This Template
 
@@ -61,8 +70,8 @@ sensitive data.
 
 Export paths:
 
-- `backups/granola-md/<meeting-folder>/...`
-- `backups/granola-json/<meeting-folder>/...`
+- `backups/granola-md/<Folder-or-_unfiled>/<meeting-folder>/...`
+- `backups/granola-json/<Folder-or-_unfiled>/<meeting-folder>/...`
 - `backups/manifests/...`
 
 ## Generated Artifacts and Git
@@ -172,3 +181,8 @@ Use `FULL_EXPORT=true` to force a full re-export.
 - `notes.md` contains manual notes typed into Granola. It can be empty even when a transcript exists.
 - `enhanced.md` contains Granola's AI-generated summary from the document panel.
 - The exporter skips overwriting existing non-empty export files with empty/null content unless `ALLOW_EMPTY_CONTENT_OVERWRITE=true` is set.
+
+## Known limitations
+
+- **Folder mirroring requires the official API key.** When running with the `GRANOLA_SUPABASE_JSON` fallback, the internal listing endpoint does not surface folder membership, so all meetings land in `_unfiled/` and reconciliation is skipped.
+- **Enhanced summaries regenerated in Granola** (e.g., when you re-run a template) only flow through incrementally if Granola bumps `updated_at` on the note. If you don't see an updated `enhanced.md`, run `FULL_EXPORT=true python scripts/export_granola.py` to refresh.

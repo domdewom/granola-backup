@@ -19,6 +19,7 @@ import html
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from html.parser import HTMLParser
@@ -52,6 +53,7 @@ PAGE_SIZE = 100
 PUBLIC_API_PAGE_SIZE = 30
 MAX_PAGES = 1000
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+UNFILED_DIR_NAME = "_unfiled"
 
 
 @dataclasses.dataclass
@@ -281,7 +283,7 @@ def safe_write(path: Path, content: str) -> bool:
 
 
 def is_effectively_empty_export(content: str) -> bool:
-    return content.strip() in {"", "null", "[]", "{}"}
+    return strip_frontmatter(content).strip() in {"", "null", "[]", "{}"}
 
 
 def safe_write_export(path: Path, content: str, allow_empty_overwrite: bool = False) -> tuple[bool, bool]:
@@ -315,6 +317,126 @@ def meeting_folder_name(created_at: str | None, title: str | None) -> str:
     date_part = parsed.strftime("%Y%m%d") if parsed else "00000000"
     title_part = sanitize_title_for_folder(title or "Untitled")
     return f"{date_part}_{title_part}"
+
+
+def folder_dir_name(folder: dict[str, Any]) -> str:
+    """Sanitized directory name for a Granola folder. Collision handling is the caller's job."""
+    return sanitize_title_for_folder(str((folder or {}).get("name") or "Untitled"))
+
+
+def primary_folder(membership: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    """Pick the primary folder for a note. Lowest folder id wins so the result is stable
+    across runs even if Granola reorders the membership list."""
+    folders = [f for f in (membership or []) if isinstance(f, dict) and f.get("id")]
+    if not folders:
+        return None
+    return sorted(folders, key=lambda f: str(f.get("id")))[0]
+
+
+def build_folder_dir_map(memberships: list[list[dict[str, Any]]]) -> dict[str, str]:
+    """Map folder id → directory name across all memberships in a run.
+    Two distinct folder ids that sanitize to the same name get a `--<id8>` suffix."""
+    by_id: dict[str, dict[str, Any]] = {}
+    for membership in memberships:
+        for f in membership or []:
+            if not isinstance(f, dict):
+                continue
+            fid = str(f.get("id") or "")
+            if fid and fid not in by_id:
+                by_id[fid] = f
+
+    grouped: dict[str, list[str]] = {}
+    for fid, f in by_id.items():
+        grouped.setdefault(folder_dir_name(f), []).append(fid)
+
+    result: dict[str, str] = {}
+    for name, ids in grouped.items():
+        if len(ids) == 1:
+            result[ids[0]] = name
+        else:
+            for fid in ids:
+                result[fid] = f"{name}--{fid[:8]}"
+    return result
+
+
+def desired_primary_dir(membership: list[dict[str, Any]] | None, folder_dir_by_id: dict[str, str]) -> str:
+    """Return the primary directory name (folder dir or _unfiled) for a meeting's membership."""
+    pf = primary_folder(membership)
+    if pf is None:
+        return UNFILED_DIR_NAME
+    fid = str(pf.get("id") or "")
+    return folder_dir_by_id.get(fid) or folder_dir_name(pf)
+
+
+def _yaml_fallback_dump(data: dict[str, Any]) -> str:
+    # Minimal YAML writer used only if PyYAML isn't importable. Keeps tests + first-run usable.
+    def encode(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        s = str(value)
+        if s == "" or any(c in s for c in ":#\n\"'[]{},&*!|>%@`") or s.strip() != s:
+            return json.dumps(s, ensure_ascii=False)
+        return s
+
+    lines: list[str] = []
+    for key, value in data.items():
+        if isinstance(value, list):
+            if not value:
+                lines.append(f"{key}: []")
+                continue
+            lines.append(f"{key}:")
+            for item in value:
+                if isinstance(item, dict):
+                    inline = ", ".join(f"{k}: {encode(v)}" for k, v in item.items())
+                    lines.append(f"  - {{ {inline} }}")
+                else:
+                    lines.append(f"  - {encode(item)}")
+        elif isinstance(value, dict):
+            inline = ", ".join(f"{k}: {encode(v)}" for k, v in value.items())
+            lines.append(f"{key}: {{ {inline} }}")
+        else:
+            lines.append(f"{key}: {encode(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def build_frontmatter(meta: dict[str, Any], file_kind: str) -> str:
+    """YAML frontmatter block (with trailing blank line) prepended to each exported .md file."""
+    fm: dict[str, Any] = {
+        "id": meta.get("id"),
+        "title": meta.get("title"),
+        "created_at": meta.get("created_at"),
+        "updated_at": meta.get("updated_at"),
+        "folder_primary": meta.get("folder_primary") or UNFILED_DIR_NAME,
+        "folders": [
+            {"id": f.get("id"), "name": f.get("name")}
+            for f in (meta.get("folder_membership") or [])
+            if isinstance(f, dict)
+        ],
+        "file_kind": file_kind,
+    }
+    if meta.get("web_url"):
+        fm["web_url"] = meta["web_url"]
+    if meta.get("attendees"):
+        fm["attendees"] = meta["attendees"]
+    if meta.get("provider"):
+        fm["provider"] = meta["provider"]
+
+    if yaml is not None:
+        body = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True, default_flow_style=False)
+    else:
+        body = _yaml_fallback_dump(fm)
+    return f"---\n{body}---\n\n"
+
+
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n.*?\r?\n---\r?\n(?:\r?\n)?", re.DOTALL)
+
+
+def strip_frontmatter(content: str) -> str:
+    return _FRONTMATTER_RE.sub("", content, count=1)
 
 
 def load_config(path: Path) -> ExportConfig:
@@ -898,10 +1020,15 @@ def transcript_to_markdown(items: list[dict[str, Any]]) -> str:
 
 def build_folders_manifest(records: list[dict[str, Any]]) -> dict[str, Any]:
     folders: dict[str, dict[str, Any]] = {}
+    unfiled: list[dict[str, Any]] = []
     for record in records:
         note_id = record.get("id")
         folder_name = record.get("folder_name")
-        for folder in record.get("folder_membership") or []:
+        membership = record.get("folder_membership") or []
+        if not membership:
+            unfiled.append({"id": note_id, "folder_name": folder_name})
+            continue
+        for folder in membership:
             if not isinstance(folder, dict):
                 continue
             fid = str(folder.get("id") or folder.get("name") or "unknown")
@@ -919,7 +1046,51 @@ def build_folders_manifest(records: list[dict[str, Any]]) -> dict[str, Any]:
             item["notes"].append({"id": note_id, "folder_name": folder_name})
 
     ordered = sorted(folders.values(), key=lambda item: str(item.get("name") or item.get("id") or ""))
-    return {"generated_at": utc_now_iso(), "folders": ordered}
+    return {
+        "generated_at": utc_now_iso(),
+        "folders": ordered,
+        "unfiled": {"note_count": len(unfiled), "notes": unfiled},
+    }
+
+
+def reconcile_export_layout(
+    prev_paths: dict[str, tuple[str, str]],
+    desired_paths: dict[str, tuple[str, str]],
+    md_root: Path,
+    json_root: Path,
+) -> list[dict[str, str]]:
+    """Remove stale per-meeting directories when a meeting's primary folder changed.
+
+    For each meeting id we previously exported, compare its previously-recorded
+    `(primary_dir, leaf)` to the current desired pair. If different, delete the old
+    location under both `md_root` and `json_root` and prune the parent if it becomes empty.
+
+    Skipped — never deletes — when desired_paths has no entry for the meeting id.
+    Callers pass an empty desired_paths to no-op the whole pass.
+    """
+    actions: list[dict[str, str]] = []
+    for mid, prev in prev_paths.items():
+        desired = desired_paths.get(mid)
+        if not desired or desired == prev:
+            continue
+        prev_primary, prev_leaf = prev
+        if not prev_leaf:
+            continue
+        for root in (md_root, json_root):
+            old_dir = root / prev_primary / prev_leaf
+            if old_dir.exists():
+                shutil.rmtree(old_dir)
+                parent = old_dir.parent
+                if parent.exists() and parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+        actions.append(
+            {
+                "id": mid,
+                "from": f"{prev_primary}/{prev_leaf}",
+                "to": f"{desired[0]}/{desired[1]}",
+            }
+        )
+    return actions
 
 
 def select_incremental_meetings(
@@ -993,12 +1164,23 @@ def run() -> int:
         sync_state_path = manifest_root / "sync_state.json"
         prev_state = safe_read_json(sync_state_path)
         last_seen = parse_iso(prev_state.get("last_max_updated_at_seen"))
+        prev_paths: dict[str, tuple[str, str]] = {
+            str(k): (str(v[0]), str(v[1]))
+            for k, v in (prev_state.get("paths_by_id") or {}).items()
+            if isinstance(v, (list, tuple)) and len(v) == 2
+        }
 
         reporter.start_phase("Discovery", 1)
         meetings = client.list_meetings(workspace_id=os.getenv("BACKUP_WORKSPACE_ID") or config.workspace_id)
         total_meetings = len(meetings)
         reporter.advance(detail=f"found {total_meetings} meetings")
         reporter.finish_phase(f"found {total_meetings} meetings")
+
+        # The official listing endpoint (/v1/notes) doesn't include folder_membership —
+        # that's only available via the per-note GET. So primary_dir is resolved inside
+        # the export loop, after we fetch the note. desired_paths is built up there.
+        desired_paths: dict[str, tuple[str, str]] = {}
+        leaves_by_primary: dict[str, set[str]] = {}
 
         prev_total_meetings = int(prev_state.get("last_total_meetings") or 0)
         allow_drop = os.getenv("ALLOW_LARGE_DROP", "false").lower() == "true"
@@ -1031,7 +1213,6 @@ def run() -> int:
             "transcript": {"populated": 0, "empty": 0},
         }
         warnings: list[dict[str, str]] = []
-        used_folder_names: set[str] = set()
 
         reporter.start_phase("Export", len(selected))
         total_selected = len(selected)
@@ -1042,13 +1223,10 @@ def run() -> int:
                 continue
 
             title = str(m.get("title") or "Untitled")
+            primary_dir = UNFILED_DIR_NAME  # resolved below from per-note data
             folder_name = meeting_folder_name(m.get("created_at"), title)
-            if folder_name in used_folder_names:
-                folder_name = f"{folder_name}--{meeting_id[:8]}"
-            used_folder_names.add(folder_name)
-
-            md_dir = md_root / folder_name
-            js_dir = json_root / folder_name
+            md_dir = md_root / primary_dir / folder_name
+            js_dir = json_root / primary_dir / folder_name
 
             try:
                 extra_outputs: list[tuple[Path, str]] = []
@@ -1072,6 +1250,15 @@ def run() -> int:
                     folder_membership = [
                         item for item in (note.get("folder_membership") or []) if isinstance(item, dict)
                     ]
+                    primary_dir = desired_primary_dir(folder_membership, {})
+                    used = leaves_by_primary.setdefault(primary_dir, set())
+                    leaf = meeting_folder_name(m.get("created_at"), title)
+                    if leaf in used:
+                        leaf = f"{leaf}--{meeting_id[:8]}"
+                    used.add(leaf)
+                    folder_name = leaf
+                    md_dir = md_root / primary_dir / folder_name
+                    js_dir = json_root / primary_dir / folder_name
                     meeting_snapshot = {
                         "id": meeting_id,
                         "object": note.get("object"),
@@ -1082,6 +1269,7 @@ def run() -> int:
                         "owner": note.get("owner"),
                         "calendar_event": note.get("calendar_event"),
                         "attendees": note.get("attendees"),
+                        "folder_primary": primary_dir,
                         "folder_membership": folder_membership,
                     }
                     extra_outputs.append((js_dir / "note.json", json.dumps(note, ensure_ascii=False, indent=2) + "\n"))
@@ -1095,6 +1283,12 @@ def run() -> int:
                     notes_md = prosemirror_to_markdown(notes_raw if isinstance(notes_raw, dict) else None)
                     enhanced_md = enhanced_to_markdown(enhanced_raw)
                     transcript_md = transcript_to_markdown(transcript)
+                    used = leaves_by_primary.setdefault(UNFILED_DIR_NAME, set())
+                    if folder_name in used:
+                        folder_name = f"{folder_name}--{meeting_id[:8]}"
+                    used.add(folder_name)
+                    md_dir = md_root / primary_dir / folder_name
+                    js_dir = json_root / primary_dir / folder_name
                     meeting_snapshot = {
                         "id": meeting_id,
                         "title": title,
@@ -1104,7 +1298,12 @@ def run() -> int:
                         "people": metadata.get("people"),
                         "creator": metadata.get("creator"),
                         "attendees": metadata.get("attendees"),
+                        "folder_primary": primary_dir,
+                        "folder_membership": [],
+                        "provider": "internal",
                     }
+
+                desired_paths[meeting_id] = (primary_dir, folder_name)
 
                 meeting_warnings: list[str] = []
                 if notes_md.strip():
@@ -1124,10 +1323,14 @@ def run() -> int:
                     content_stats["transcript"]["empty"] += 1
                     meeting_warnings.append("missing-transcript-content")
 
+                notes_fm = build_frontmatter(meeting_snapshot, "notes")
+                enhanced_fm = build_frontmatter(meeting_snapshot, "enhanced")
+                transcript_fm = build_frontmatter(meeting_snapshot, "transcript")
+
                 outputs: list[tuple[Path, str]] = [
-                    (md_dir / "notes.md", notes_md),
-                    (md_dir / "enhanced.md", enhanced_md),
-                    (md_dir / "transcript.md", transcript_md),
+                    (md_dir / "notes.md", notes_fm + notes_md),
+                    (md_dir / "enhanced.md", enhanced_fm + enhanced_md),
+                    (md_dir / "transcript.md", transcript_fm + transcript_md),
                     (js_dir / "notes.json", json.dumps(notes_raw, ensure_ascii=False, indent=2) + "\n"),
                     (js_dir / "enhanced.json", json.dumps(enhanced_raw, ensure_ascii=False, indent=2) + "\n"),
                     (js_dir / "transcript.json", json.dumps(transcript, ensure_ascii=False, indent=2) + "\n"),
@@ -1169,6 +1372,7 @@ def run() -> int:
                 exported_records.append(
                     {
                         "id": meeting_id,
+                        "primary_dir": primary_dir,
                         "folder_name": folder_name,
                         "updated_at": m.get("updated_at"),
                         "folder_membership": folder_membership,
@@ -1212,6 +1416,11 @@ def run() -> int:
         }
 
         reporter.start_phase("Finalize", 1)
+        reconcile_actions: list[dict[str, str]] = []
+        if provider == "official":
+            reconcile_actions = reconcile_export_layout(prev_paths, desired_paths, md_root, json_root)
+        if reconcile_actions:
+            manifest["run"]["reconcile_actions"] = reconcile_actions
         manifest_path = manifest_root / "manifest.json"
         safe_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
         if provider == "official":
@@ -1224,10 +1433,17 @@ def run() -> int:
             print(f"Export completed with {len(errors)} errors", file=sys.stderr)
             return 1
 
+        # Merge previously-known paths with paths resolved this run, so notes that weren't
+        # re-fetched this run still have an accurate location on file for the next run's
+        # reconciliation pass.
+        merged_paths: dict[str, list[str]] = {mid: list(p) for mid, p in prev_paths.items()}
+        for mid, p in desired_paths.items():
+            merged_paths[mid] = list(p)
         new_state = {
             "last_successful_sync_utc": utc_now_iso(),
             "last_max_updated_at_seen": max_seen,
             "last_total_meetings": total_meetings,
+            "paths_by_id": merged_paths,
         }
         safe_write(sync_state_path, json.dumps(new_state, ensure_ascii=False, indent=2) + "\n")
         reporter.advance(detail="manifest and sync state written")

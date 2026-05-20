@@ -1,6 +1,7 @@
 import datetime as dt
 import importlib.util
 import sys
+import yaml
 from pathlib import Path
 
 
@@ -230,11 +231,18 @@ def test_build_folders_manifest():
                 "folder_name": "20260102_Second",
                 "folder_membership": [{"id": "fol_1", "object": "folder", "name": "Recruiting"}],
             },
+            {
+                "id": "not_3",
+                "folder_name": "20260103_Loose",
+                "folder_membership": [],
+            },
         ]
     )
     assert manifest["folders"][0]["id"] == "fol_1"
     assert manifest["folders"][0]["note_count"] == 2
     assert manifest["folders"][0]["notes"][1]["id"] == "not_2"
+    assert manifest["unfiled"]["note_count"] == 1
+    assert manifest["unfiled"]["notes"][0]["id"] == "not_3"
 
 
 def test_enhanced_content_prefers_meeting_panel():
@@ -299,3 +307,162 @@ def test_progress_auto_ci_is_quiet(monkeypatch):
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     reporter = m.create_progress_reporter()
     assert reporter.__class__.__name__ == "NullProgressReporter"
+
+
+def test_primary_folder_is_deterministic_by_id():
+    membership = [
+        {"id": "fol_z", "name": "Zebra"},
+        {"id": "fol_a", "name": "Alpha"},
+        {"id": "fol_m", "name": "Middle"},
+    ]
+    assert m.primary_folder(membership)["id"] == "fol_a"
+    # Reordering input should not change the answer.
+    assert m.primary_folder(list(reversed(membership)))["id"] == "fol_a"
+
+
+def test_primary_folder_returns_none_when_unfiled():
+    assert m.primary_folder([]) is None
+    assert m.primary_folder(None) is None
+
+
+def test_folder_dir_map_disambiguates_collisions():
+    memberships = [
+        [{"id": "fol_1111aaaa", "name": "Future / Plans"}],
+        [{"id": "fol_2222bbbb", "name": "Future-Plans"}],
+        [{"id": "fol_3333cccc", "name": "Distinct"}],
+    ]
+    mapping = m.build_folder_dir_map(memberships)
+    assert mapping["fol_3333cccc"] == "Distinct"
+    # Two distinct ids sanitize to the same name → both get suffixed.
+    assert mapping["fol_1111aaaa"] == "Future-Plans--fol_1111"
+    assert mapping["fol_2222bbbb"] == "Future-Plans--fol_2222"
+
+
+def test_desired_primary_dir_unfiled_when_no_membership():
+    assert m.desired_primary_dir([], {}) == m.UNFILED_DIR_NAME
+    assert m.desired_primary_dir(None, {}) == m.UNFILED_DIR_NAME
+
+
+def test_desired_primary_dir_uses_dir_map():
+    membership = [{"id": "fol_a", "name": "Future"}]
+    folder_map = {"fol_a": "Future"}
+    assert m.desired_primary_dir(membership, folder_map) == "Future"
+
+
+def test_build_frontmatter_is_valid_yaml():
+    snapshot = {
+        "id": "not_1",
+        "title": "Glen / Jakob",
+        "created_at": "2026-05-07T14:00:00Z",
+        "updated_at": "2026-05-08T09:12:33Z",
+        "web_url": "https://app.granola.ai/notes/not_1",
+        "folder_primary": "Carlo",
+        "folder_membership": [{"id": "fol_1", "name": "Carlo"}],
+        "attendees": [{"name": "Glen", "email": "glen@example.com"}],
+    }
+    rendered = m.build_frontmatter(snapshot, "notes")
+    assert rendered.startswith("---\n")
+    assert rendered.endswith("---\n\n")
+    body = rendered[4:-5]  # strip leading "---\n" and trailing "---\n\n"
+    parsed = yaml.safe_load(body)
+    assert parsed["id"] == "not_1"
+    assert parsed["folder_primary"] == "Carlo"
+    assert parsed["folders"] == [{"id": "fol_1", "name": "Carlo"}]
+    assert parsed["file_kind"] == "notes"
+    assert parsed["web_url"] == "https://app.granola.ai/notes/not_1"
+
+
+def test_build_frontmatter_internal_provider_marks_unfiled():
+    snapshot = {
+        "id": "not_1",
+        "title": "T",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+        "folder_primary": m.UNFILED_DIR_NAME,
+        "folder_membership": [],
+        "provider": "internal",
+    }
+    parsed = yaml.safe_load(m.build_frontmatter(snapshot, "enhanced")[4:-5])
+    assert parsed["folder_primary"] == m.UNFILED_DIR_NAME
+    assert parsed["folders"] == []
+    assert parsed["provider"] == "internal"
+    assert "web_url" not in parsed
+
+
+def test_is_effectively_empty_with_frontmatter_only():
+    fm_only = "---\nid: not_1\nfile_kind: notes\n---\n\n"
+    assert m.is_effectively_empty_export(fm_only) is True
+    # And a real body should NOT register as empty.
+    fm_with_body = fm_only + "## Heading\n\nSome content\n"
+    assert m.is_effectively_empty_export(fm_with_body) is False
+
+
+def test_strip_frontmatter_only_strips_leading_block():
+    body = "---\nid: x\n---\n\nKeep this --- in body --- intact\n"
+    assert m.strip_frontmatter(body) == "Keep this --- in body --- intact\n"
+
+
+def test_reconcile_export_layout_moves_and_prunes(tmp_path):
+    md_root = tmp_path / "md"
+    json_root = tmp_path / "json"
+    # Previous run wrote to _unfiled/foo
+    (md_root / "_unfiled" / "foo").mkdir(parents=True)
+    (md_root / "_unfiled" / "foo" / "notes.md").write_text("old\n", encoding="utf-8")
+    (json_root / "_unfiled" / "foo").mkdir(parents=True)
+    (json_root / "_unfiled" / "foo" / "notes.json").write_text("null\n", encoding="utf-8")
+    # Current run wrote to Future/foo (simulate the export loop having placed it there)
+    (md_root / "Future" / "foo").mkdir(parents=True)
+    (md_root / "Future" / "foo" / "notes.md").write_text("new\n", encoding="utf-8")
+
+    actions = m.reconcile_export_layout(
+        prev_paths={"not_1": ("_unfiled", "foo")},
+        desired_paths={"not_1": ("Future", "foo")},
+        md_root=md_root,
+        json_root=json_root,
+    )
+    assert len(actions) == 1
+    assert actions[0]["from"] == "_unfiled/foo"
+    assert actions[0]["to"] == "Future/foo"
+    # Old location is gone, parent was empty so pruned too.
+    assert not (md_root / "_unfiled" / "foo").exists()
+    assert not (md_root / "_unfiled").exists()
+    assert not (json_root / "_unfiled").exists()
+    # New location still present.
+    assert (md_root / "Future" / "foo" / "notes.md").read_text() == "new\n"
+
+
+def test_reconcile_export_layout_keeps_parent_with_siblings(tmp_path):
+    md_root = tmp_path / "md"
+    json_root = tmp_path / "json"
+    (md_root / "Future" / "foo").mkdir(parents=True)
+    (md_root / "Future" / "bar").mkdir(parents=True)
+    (md_root / "Carlo" / "foo").mkdir(parents=True)
+    (json_root / "Future" / "foo").mkdir(parents=True)
+    (json_root / "Future" / "bar").mkdir(parents=True)
+    (json_root / "Carlo" / "foo").mkdir(parents=True)
+
+    actions = m.reconcile_export_layout(
+        prev_paths={"not_1": ("Future", "foo")},
+        desired_paths={"not_1": ("Carlo", "foo")},
+        md_root=md_root,
+        json_root=json_root,
+    )
+    assert len(actions) == 1
+    assert not (md_root / "Future" / "foo").exists()
+    # Parent retained because bar sibling still lives there.
+    assert (md_root / "Future" / "bar").exists()
+    assert (md_root / "Future").exists()
+
+
+def test_reconcile_export_layout_skips_when_desired_missing(tmp_path):
+    md_root = tmp_path / "md"
+    json_root = tmp_path / "json"
+    (md_root / "Future" / "foo").mkdir(parents=True)
+    actions = m.reconcile_export_layout(
+        prev_paths={"not_1": ("Future", "foo")},
+        desired_paths={},  # listing data missing → no-op
+        md_root=md_root,
+        json_root=json_root,
+    )
+    assert actions == []
+    assert (md_root / "Future" / "foo").exists()

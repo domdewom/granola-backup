@@ -18,12 +18,12 @@ For each meeting, it exports:
 
 Meeting folder naming:
 
-- `YYYYMMDD_Title` (example: `20260303_Allie`)
+- `YYYYMMDD_Title` (example: `20260303_John_Doe`)
 - if two meetings collide on same date/title within the same parent folder, exporter appends `--<id8>`
 
 Folder structure mirrors Granola:
 
-- A meeting's directory lives under its primary Granola folder, e.g. `backups/granola-md/Future/20260427_Dominic-Anton/`.
+- A meeting's directory lives under its primary Granola folder, e.g. `backups/granola-md/company_x/20260427_Dom-John_Doe/`.
 - Notes not assigned to a Granola folder live in `_unfiled/`.
 - When a note is in multiple folders, the lowest folder id wins (deterministic across runs); the full membership is recorded in each meeting's frontmatter and in `backups/manifests/folders.json`.
 - When a meeting is reassigned in Granola, the next run moves it to the new folder and prunes the old directory — provided Granola bumped the note's `updated_at` (which it normally does on folder moves). If a move ever doesn't propagate, run `FULL_EXPORT=true python scripts/export_granola.py`.
